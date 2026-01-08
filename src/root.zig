@@ -1,4 +1,5 @@
 const std = @import("std");
+const http = std.http;
 
 pub const ServerOptions = struct {
     port: u16 = 8080,
@@ -34,66 +35,26 @@ pub fn serve(listener: *std.net.Server, options: ServeOptions) !void {
 fn handleConnection(connection: *std.net.Server.Connection) !void {
     defer connection.stream.close();
 
-    var request_buffer: [2048]u8 = undefined;
-    const request = readRequest(&connection.stream, &request_buffer) catch {
-        try respond(&connection.stream, "400 Bad Request", "bad request");
-        return;
-    };
+    var read_buffer: [4096]u8 = undefined;
+    var write_buffer: [4096]u8 = undefined;
 
-    const target = extractTarget(request) catch {
-        try respond(&connection.stream, "400 Bad Request", "bad request");
-        return;
-    };
+    var reader = connection.stream.reader(&read_buffer);
+    var writer = connection.stream.writer(&write_buffer);
+    var server = http.Server.init(reader.interface(), &writer.interface);
 
-    if (std.mem.eql(u8, target, "/v1/ping")) {
-        try respond(&connection.stream, "200 OK", "pong");
-        return;
-    }
-
-    try respond(&connection.stream, "404 Not Found", "not found");
-}
-
-fn readRequest(stream: *std.net.Stream, buffer: []u8) ![]const u8 {
-    var used: usize = 0;
     while (true) {
-        if (used == buffer.len) return error.RequestTooLarge;
+        var request = server.receiveHead() catch |err| switch (err) {
+            error.HttpConnectionClosing => break,
+            else => return err,
+        };
 
-        const amount = try stream.read(buffer[used..]);
-        if (amount == 0) return error.UnexpectedConnectionClose;
-
-        used += amount;
-        if (std.mem.indexOf(u8, buffer[0..used], "\r\n\r\n")) |_| {
-            return buffer[0..used];
+        if (std.mem.eql(u8, request.head.target, "/v1/ping")) {
+            try request.respond("pong", .{ .status = .ok, .keep_alive = false });
+        } else {
+            try request.respond("not found", .{ .status = .not_found, .keep_alive = false });
         }
+        break;
     }
-}
-
-fn extractTarget(request: []const u8) ![]const u8 {
-    const newline_index = std.mem.indexOfScalar(u8, request, '\n') orelse
-        return error.InvalidRequest;
-    const first_line = std.mem.trim(u8, request[0..newline_index], " \r\n");
-
-    const method_end = std.mem.indexOfScalar(u8, first_line, ' ') orelse
-        return error.InvalidRequest;
-    const method = first_line[0..method_end];
-    if (!std.mem.eql(u8, method, "GET")) return error.UnsupportedMethod;
-
-    const remainder = first_line[method_end + 1 ..];
-    const target_end = std.mem.indexOfScalar(u8, remainder, ' ') orelse
-        return error.InvalidRequest;
-
-    return remainder[0..target_end];
-}
-
-fn respond(stream: *std.net.Stream, status_line: []const u8, body: []const u8) !void {
-    var response_buffer: [256]u8 = undefined;
-    const response = try std.fmt.bufPrint(
-        &response_buffer,
-        "HTTP/1.1 {s}\r\nContent-Length: {d}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{s}",
-        .{ status_line, body.len, body },
-    );
-
-    try stream.writeAll(response);
 }
 
 fn serveOnce(listener: *std.net.Server) void {
